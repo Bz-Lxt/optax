@@ -16,7 +16,7 @@
 
 import functools
 import operator
-from typing import Optional, Union
+from typing import NamedTuple, Optional, Union
 
 import jax
 import jax.numpy as jnp
@@ -682,6 +682,277 @@ def convex_kl_divergence(
   )
 
 
+class CTCLossState(NamedTuple):
+  """Finite state carried between CTC logit chunks.
+
+  The state captures the CTC forward dynamic-programming variables after
+  processing some prefix of the logit sequence. Its shapes depend only on the
+  batch size and the label length, not on the number of processed time frames,
+  so it stays bounded no matter how many chunks are processed.
+
+  Attributes:
+    logalpha_phi: (B, N+1)-array of log forward-probabilities of ending each
+      prefix in a blank state, where ``N`` is the (padded) label length.
+    logalpha_emit: (B, N)-array of log forward-probabilities of ending each
+      prefix right after emitting a label.
+    labels: (B, N)-array containing the reference integer labels.
+    repeat: (B, N)-array whose ``[b, n]`` entry is 1.0 when
+      ``labels[b, n] == labels[b, n + 1]`` and 0.0 otherwise.
+    label_lengths: (B,)-array with the unpadded length of each label sequence.
+    log_epsilon: scalar numerically-stable approximation of log(+0).
+  """
+
+  logalpha_phi: jax.Array
+  logalpha_emit: jax.Array
+  labels: jax.Array
+  repeat: jax.Array
+  label_lengths: jax.Array
+  log_epsilon: jax.Array
+
+
+def _ctc_repeat_mask(labels: jax.Array) -> jax.Array:
+  # repeat[b, n] == 1.0 when label[b, n] == label[b, n+1]. The last column is
+  # always zero. The trailing slice keeps the shape (B, 0) for empty targets.
+  # pyrefly: ignore[bad-index]
+  repeat = (labels[:, :-1] == labels[:, 1:]).astype(jnp.float32)
+  repeat = jnp.pad(repeat, ((0, 0), (0, 1)))
+  # pyrefly: ignore[bad-index]
+  return repeat[:, : labels.shape[1]]
+
+
+def _ctc_update_phi_score(
+    phi: jax.Array, added_score: jax.Array
+) -> jax.Array:
+  # Update `phi[:, 1:]`` with adding `added_score` in log space.
+  return jnp.concatenate(
+      [phi[:, :1], jnp.logaddexp(phi[:, 1:], added_score)], axis=-1
+  )
+
+
+def ctc_loss_init(
+    labels: jax.typing.ArrayLike,
+    label_paddings: jax.typing.ArrayLike,
+    *,
+    log_epsilon: jax.typing.ArrayLike = -1e5,
+) -> CTCLossState:
+  r"""Initializes the finite state for chunk-wise (streaming) CTC loss.
+
+  This is the entry point of the chunked CTC API. Call
+  :func:`ctc_loss_update` for every arriving logit chunk and
+  :func:`ctc_loss_finalize` once all chunks have been consumed::
+
+      state = optax.losses.ctc_loss_init(labels, label_paddings)
+      for logits_chunk, padding_chunk in chunks:
+        state = optax.losses.ctc_loss_update(
+            state, logits_chunk, padding_chunk)
+      per_seq_loss = optax.losses.ctc_loss_finalize(state)
+
+  Folding the chunks this way performs exactly the same arithmetic, in the
+  same order, as feeding the complete logits into :func:`ctc_loss`; hence the
+  final per-sequence loss and its gradients w.r.t. every chunk are identical
+  to the one-shot computation. The state contains only arrays whose shapes
+  depend on ``B`` and ``N`` (not on the number of processed time frames), so a
+  single ``jax.jit``-compiled update can be reused for every chunk.
+
+  Args:
+    labels: (B, N)-array containing reference integer labels where ``N``
+      denotes the max label length. ``N`` may be zero for empty targets.
+      ``labels`` must be right-padded, i.e. each row of ``label_paddings``
+      must be zeroes followed by ones.
+    label_paddings: (B, N)-array. Padding indicators for ``labels``. Each
+      element must be either 1.0 or 0.0, and ``label_paddings[b, n] == 1.0``
+      denotes that ``labels[b, n]`` is a padded label.
+    log_epsilon: Numerically-stable approximation of log(+0).
+
+  Returns:
+    A :class:`CTCLossState` with initial CTC forward-probabilities.
+  """
+  labels = jnp.asarray(labels)
+  label_paddings = jnp.asarray(label_paddings)
+  utils.check_rank(labels, 2)
+  utils.check_shapes_equal(labels, label_paddings)
+  # pyrefly: ignore [missing-attribute]
+  batchsize, maxlabellen = labels.shape
+
+  repeat = _ctc_repeat_mask(labels)
+  label_lengths = (
+      maxlabellen - jnp.sum(label_paddings, axis=1).astype(jnp.int32)
+  )
+
+  logalpha_phi_init = jnp.ones((batchsize, maxlabellen + 1)) * log_epsilon
+  logalpha_phi_init = logalpha_phi_init.at[:, 0].set(0.0)
+  logalpha_emit_init = jnp.ones((batchsize, maxlabellen)) * log_epsilon
+
+  return CTCLossState(
+      logalpha_phi=logalpha_phi_init,
+      logalpha_emit=logalpha_emit_init,
+      labels=labels,
+      repeat=repeat,
+      label_lengths=label_lengths,
+      log_epsilon=jnp.asarray(log_epsilon),
+  )
+
+
+def _ctc_scan(
+    logalpha_phi: jax.Array,
+    logalpha_emit: jax.Array,
+    logits: jax.Array,
+    logit_paddings: jax.Array,
+    labels: jax.Array,
+    repeat: jax.Array,
+    blank_id: int,
+    log_epsilon: jax.Array,
+    collect: bool,
+) -> tuple[jax.Array, jax.Array, Optional[tuple[jax.Array, jax.Array]]]:
+  # Runs the CTC forward recursion over one logit chunk. ``log_softmax`` is
+  # normalized per time frame, so the logits can be split into chunks without
+  # affecting the numerical result.
+  # pyrefly: ignore [missing-attribute]
+  batchsize = logits.shape[0]
+
+  logprobs = jax.nn.log_softmax(logits)
+
+  logprobs_phi = logprobs[:, :, blank_id : blank_id + 1]  # [B, T, 1]
+  logprobs_phi = jnp.transpose(logprobs_phi, (1, 0, 2))  # [T, B, 1]
+
+  # pyrefly: ignore [missing-attribute]
+  num_classes = logits.shape[-1]
+  one_hot = jax.nn.one_hot(labels, num_classes=num_classes)  # [B, N, K]
+  logprobs_emit = jnp.einsum('btk,bnk->btn', logprobs, one_hot)
+  logprobs_emit = jnp.transpose(logprobs_emit, (1, 0, 2))  # [T, B, N]
+
+  def loop_body(prev, x):
+    prev_phi, prev_emit = prev
+    # emit-to-phi epsilon transition, except if the next label is repetition
+    prev_phi_orig = prev_phi
+    prev_phi = _ctc_update_phi_score(
+        prev_phi, prev_emit + log_epsilon * repeat
+    )
+
+    logprob_emit, logprob_phi, pad = x
+
+    # phi-to-emit transition
+    next_emit = jnp.logaddexp(
+        prev_phi[:, :-1] + logprob_emit, prev_emit + logprob_emit
+    )
+    # self-loop transition
+    next_phi = prev_phi + logprob_phi
+    # emit-to-phi blank transition only when the next label is repetition
+    next_phi = _ctc_update_phi_score(
+        next_phi, prev_emit + logprob_phi + log_epsilon * (1.0 - repeat)
+    )
+
+    pad = pad.reshape((batchsize, 1))
+    next_emit = pad * prev_emit + (1.0 - pad) * next_emit
+    next_phi = pad * prev_phi_orig + (1.0 - pad) * next_phi
+
+    outputs = (next_phi, next_emit) if collect else None
+    return (next_phi, next_emit), outputs
+
+  # pyrefly: ignore [missing-attribute]
+  xs = (logprobs_emit, logprobs_phi, logit_paddings.transpose((1, 0)))
+  (logalpha_phi, logalpha_emit), stacked = jax.lax.scan(
+      loop_body, (logalpha_phi, logalpha_emit), xs
+  )
+  return logalpha_phi, logalpha_emit, stacked
+
+
+def ctc_loss_update(
+    state: CTCLossState,
+    logits: jax.typing.ArrayLike,
+    logit_paddings: jax.typing.ArrayLike,
+    *,
+    blank_id: int = 0,
+) -> CTCLossState:
+  r"""Consumes one logit chunk and advances the CTC forward state.
+
+  The update is a pure, JIT-compatible function of the previous
+  :class:`CTCLossState` and the chunk. Chaining updates over a partition of the
+  time axis is arithmetically identical to a single one-shot CTC forward pass,
+  including when mandatory blanks of repeated labels fall across a chunk
+  boundary or when different batch sequences enter their right-padded region
+  in different chunks. Padded frames leave the state untouched.
+
+  Args:
+    state: The state returned by :func:`ctc_loss_init` or a previous call to
+      :func:`ctc_loss_update`.
+    logits: (B, T_c, K)-array containing the logits of one chunk where
+      ``T_c`` denotes the number of time frames in the chunk and ``K`` the
+      number of classes including a class for blanks. ``T_c`` may vary
+      between chunks; a fixed ``T_c`` allows reusing one compiled function.
+    logit_paddings: (B, T_c)-array. Padding indicators for ``logits``. Each
+      element must be either 1.0 or 0.0, and ``logit_paddings[b, t] == 1.0``
+      denotes that ``logits[b, t, :]`` are padded values.
+    blank_id: Id for blank token. ``logits[b, :, blank_id]`` are used as
+      probabilities of blank symbols. Must be the same for every chunk.
+
+  Returns:
+    The updated :class:`CTCLossState` with the same array shapes as the input
+    state.
+  """
+  logits = jnp.asarray(logits)
+  logit_paddings = jnp.asarray(logit_paddings)
+  utils.check_rank(logits, 3)
+  # pyrefly: ignore[bad-index]
+  utils.check_shapes_equal(logits[..., 0], logit_paddings)
+  # pyrefly: ignore [missing-attribute]
+  batchsize = logits.shape[0]
+  if batchsize != state.logalpha_phi.shape[0]:
+    raise ValueError(
+        f'Expected `logits` to have batch size'
+        f' {state.logalpha_phi.shape[0]}, got {batchsize}.'
+    )
+
+  logalpha_phi, logalpha_emit, _ = _ctc_scan(
+      state.logalpha_phi,
+      state.logalpha_emit,
+      logits,
+      logit_paddings,
+      state.labels,
+      state.repeat,
+      blank_id,
+      state.log_epsilon,
+      collect=False,
+  )
+  return state._replace(
+      logalpha_phi=logalpha_phi, logalpha_emit=logalpha_emit
+  )
+
+
+def ctc_loss_finalize(state: CTCLossState) -> jax.Array:
+  """Computes the per-sequence CTC loss from the accumulated state.
+
+  Applies the final epsilon transition and reads off the forward probability
+  of consuming the complete label sequence. Call this once after the last
+  chunk. The result is identical to :func:`ctc_loss` on the concatenated
+  logits, and gradients propagate back through every chunk consumed by
+  :func:`ctc_loss_update`.
+
+  Args:
+    state: The state after processing all logit chunks.
+
+  Returns:
+    (B,)-array containing loss values for each sequence in the batch.
+  """
+  # last row needs to be updated with the last epsilon transition
+  logalpha_phi_last = _ctc_update_phi_score(
+      state.logalpha_phi, state.logalpha_emit
+  )
+
+  # Probabilities cannot exceed 1.0 (log-probabilities cannot exceed 0.0). Due
+  # to float32 rounding in log_softmax and logaddexp, values can round slightly
+  # above zero for confident predictions. Clamp to maintain mathematical
+  # bounds.
+  logalpha_phi_last = jnp.minimum(logalpha_phi_last, 0.0)
+
+  # extract per_seq_loss
+  one_hot = jax.nn.one_hot(
+      state.label_lengths, num_classes=state.logalpha_phi.shape[1]
+  )  # [B, N+1]
+  per_seq_loss = -jnp.einsum('bn,bn->b', logalpha_phi_last, one_hot)  # pylint:disable=invalid-unary-operand-type
+  return jnp.maximum(per_seq_loss, 0.0)
+
+
 def ctc_loss_with_forward_probs(
     logits: jax.typing.ArrayLike,
     logit_paddings: jax.typing.ArrayLike,
@@ -710,6 +981,10 @@ def ctc_loss_with_forward_probs(
   Here, :math:`\pi` denotes the alignment sequence in the reference
   [Graves et al, 2006] that is blank-inserted representations of ``labels``.
   The return values are the logarithms of the above probabilities.
+
+  This is the one-shot equivalent of :func:`ctc_loss_init`,
+  :func:`ctc_loss_update` and :func:`ctc_loss_finalize` on the complete logit
+  sequence; both code paths share the same per-frame arithmetic.
 
   Args:
     logits: (B, T, K)-array containing logits of each class where B denotes
@@ -749,91 +1024,51 @@ def ctc_loss_with_forward_probs(
   utils.check_shapes_equal(labels, label_paddings)
   # pyrefly: ignore[bad-index]
   utils.check_shapes_equal(logits[..., 0], logit_paddings)
+  logits = jnp.asarray(logits)
   # pyrefly: ignore [missing-attribute]
-  batchsize, unused_maxinputlen, num_classes = logits.shape
+  batchsize = logits.shape[0]
   # pyrefly: ignore [missing-attribute]
-  batchsize_of_labels, maxlabellen = labels.shape
+  batchsize_of_labels = labels.shape[0]
   if batchsize_of_labels != batchsize:
     raise ValueError(
         f'Expected `labels` to have batch size {batchsize}, got'
         f' {batchsize_of_labels}.'
     )
 
-  logprobs = jax.nn.log_softmax(logits)
-  labellens = maxlabellen - jnp.sum(label_paddings, axis=1).astype(jnp.int32)
-
-  # repeat[b, n] == 1.0 when label[b, n] == label[b, n+1].
-  # pyrefly: ignore[bad-index]
-  repeat = (labels[:, :-1] == labels[:, 1:]).astype(jnp.float32)
-  repeat = jnp.pad(repeat, ((0, 0), (0, 1)))
-
-  logprobs_phi = logprobs[:, :, blank_id : blank_id + 1]  # [B, T, 1]
-  logprobs_phi = jnp.transpose(logprobs_phi, (1, 0, 2))  # [T, B, 1]
-
-  one_hot = jax.nn.one_hot(labels, num_classes=num_classes)  # [B, N, K]
-  logprobs_emit = jnp.einsum('btk,bnk->btn', logprobs, one_hot)
-  logprobs_emit = jnp.transpose(logprobs_emit, (1, 0, 2))  # [T, B, N]
-
-  logalpha_phi_init = (
-      jnp.ones((batchsize, maxlabellen + 1)) * log_epsilon
-  )  # [B, N]
-  logalpha_phi_init = logalpha_phi_init.at[:, 0].set(0.0)
-  logalpha_emit_init = jnp.ones((batchsize, maxlabellen)) * log_epsilon
-
-  def update_phi_score(phi, added_score):
-    # Update `phi[:, 1:]`` with adding `added_score` in log space.
-    return jnp.concatenate(
-        [phi[:, :1], jnp.logaddexp(phi[:, 1:], added_score)], axis=-1
-    )
-
-  def loop_body(prev, x):
-    prev_phi, prev_emit = prev
-    # emit-to-phi epsilon transition, except if the next label is repetition
-    prev_phi_orig = prev_phi
-    prev_phi = update_phi_score(prev_phi, prev_emit + log_epsilon * repeat)
-
-    logprob_emit, logprob_phi, pad = x
-
-    # phi-to-emit transition
-    next_emit = jnp.logaddexp(
-        prev_phi[:, :-1] + logprob_emit, prev_emit + logprob_emit
-    )
-    # self-loop transition
-    next_phi = prev_phi + logprob_phi
-    # emit-to-phi blank transition only when the next label is repetition
-    next_phi = update_phi_score(
-        next_phi, prev_emit + logprob_phi + log_epsilon * (1.0 - repeat)
-    )
-
-    pad = pad.reshape((batchsize, 1))
-    next_emit = pad * prev_emit + (1.0 - pad) * next_emit
-    next_phi = pad * prev_phi_orig + (1.0 - pad) * next_phi
-
-    return (next_phi, next_emit), (next_phi, next_emit)
-
-  # pyrefly: ignore [missing-attribute]
-  xs = (logprobs_emit, logprobs_phi, logit_paddings.transpose((1, 0)))
-  _, (logalpha_phi, logalpha_emit) = jax.lax.scan(
-      loop_body, (logalpha_phi_init, logalpha_emit_init), xs
+  state = ctc_loss_init(labels, label_paddings, log_epsilon=log_epsilon)
+  logalpha_phi, logalpha_emit, stacked = _ctc_scan(
+      state.logalpha_phi,
+      state.logalpha_emit,
+      logits,
+      jnp.asarray(logit_paddings),
+      state.labels,
+      state.repeat,
+      blank_id,
+      state.log_epsilon,
+      collect=True,
   )
+  assert stacked is not None  # required to return the stacked alphas
+  logalpha_phi_stack, logalpha_emit_stack = stacked
 
   # last row needs to be updated with the last epsilon transition
-  logalpha_phi_last = update_phi_score(logalpha_phi[-1], logalpha_emit[-1])
-  logalpha_phi = logalpha_phi.at[-1].set(logalpha_phi_last)
+  logalpha_phi_last = _ctc_update_phi_score(
+      logalpha_phi_stack[-1], logalpha_emit_stack[-1]
+  )
+  logalpha_phi_stack = logalpha_phi_stack.at[-1].set(logalpha_phi_last)
 
   # Probabilities cannot exceed 1.0 (log-probabilities cannot exceed 0.0). Due
   # to float32 rounding in log_softmax and logaddexp, values can round slightly
   # above zero for confident predictions. Clamp to maintain mathematical bounds.
-  logalpha_phi = jnp.minimum(logalpha_phi, 0.0)
-  logalpha_emit = jnp.minimum(logalpha_emit, 0.0)
-  logalpha_phi_last = logalpha_phi[-1]
+  logalpha_phi_stack = jnp.minimum(logalpha_phi_stack, 0.0)
+  logalpha_emit_stack = jnp.minimum(logalpha_emit_stack, 0.0)
 
-  # extract per_seq_loss
-  one_hot = jax.nn.one_hot(labellens, num_classes=maxlabellen + 1)  # [B, N+1]
-  per_seq_loss = -jnp.einsum('bn,bn->b', logalpha_phi_last, one_hot)  # pylint:disable=invalid-unary-operand-type
-  per_seq_loss = jnp.maximum(per_seq_loss, 0.0)
+  per_seq_loss = ctc_loss_finalize(
+      state._replace(
+          logalpha_phi=logalpha_phi, logalpha_emit=logalpha_emit
+      )
+  )
 
-  return per_seq_loss, logalpha_phi, logalpha_emit
+  return per_seq_loss, logalpha_phi_stack, logalpha_emit_stack
 
 
 def ctc_loss(
@@ -847,17 +1082,19 @@ def ctc_loss(
 ) -> jax.Array:
   """Computes CTC loss.
 
-  See docstring for ``ctc_loss_with_forward_probs`` for details.
+  See docstring for ``ctc_loss_with_forward_probs`` for details. For logits
+  that arrive in chunks, use :func:`ctc_loss_init`,
+  :func:`ctc_loss_update` and :func:`ctc_loss_finalize` instead.
 
   Args:
-    logits: (B, T, K)-array containing logits of each class where B denotes the
-      batch size, T denotes the max time frames in ``logits``, and K denotes the
-      number of classes including a class for blanks.
+    logits: (B, T, K)-array containing logits of each class where B denotes
+      the batch size, T denotes the max time frames in ``logits``, and K
+      denotes the number of classes including a class for blanks.
     logit_paddings: (B, T)-array. Padding indicators for ``logits``. Each
       element must be either 1.0 or 0.0, and ``logitpaddings[b, t] == 1.0``
       denotes that ``logits[b, t, :]`` are padded values.
-    labels: (B, N)-array containing reference integer labels where N denotes the
-      max time frames in the label sequence.
+    labels: (B, N)-array containing reference integer labels where N denotes
+      the max time frames in the label sequence.
     label_paddings: (B, N)-array. Padding indicators for ``labels``. Each
       element must be either 1.0 or 0.0, and ``labelpaddings[b, n] == 1.0``
       denotes that ``labels[b, n]`` is a padded label. In the current

@@ -245,7 +245,11 @@ WrappedSchedule = schedules.WrappedSchedule
 convex_kl_divergence = losses.convex_kl_divergence
 cosine_distance = losses.cosine_distance
 cosine_similarity = losses.cosine_similarity
+CTCLossState = losses.CTCLossState
 ctc_loss = losses.ctc_loss
+ctc_loss_finalize = losses.ctc_loss_finalize
+ctc_loss_init = losses.ctc_loss_init
+ctc_loss_update = losses.ctc_loss_update
 ctc_loss_with_forward_probs = losses.ctc_loss_with_forward_probs
 generalized_kl_divergence = losses.generalized_kl_divergence
 hinge_loss = losses.hinge_loss
@@ -354,7 +358,11 @@ __all__ = (
     "conditionally_transform",
     "ConditionallyTransformState",
     "constant_schedule",
+    "CTCLossState",
     "ctc_loss",
+    "ctc_loss_finalize",
+    "ctc_loss_init",
+    "ctc_loss_update",
     "ctc_loss_with_forward_probs",
     "convex_kl_divergence",
     "cosine_decay_schedule",

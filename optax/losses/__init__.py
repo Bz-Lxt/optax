@@ -16,8 +16,12 @@
 
 # pylint:disable=g-importing-member
 
+from optax.losses._classification import CTCLossState
 from optax.losses._classification import convex_kl_divergence
 from optax.losses._classification import ctc_loss
+from optax.losses._classification import ctc_loss_finalize
+from optax.losses._classification import ctc_loss_init
+from optax.losses._classification import ctc_loss_update
 from optax.losses._classification import ctc_loss_with_forward_probs
 from optax.losses._classification import generalized_kl_divergence
 from optax.losses._classification import hinge_loss

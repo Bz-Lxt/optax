@@ -995,6 +995,402 @@ class CTCTest(parameterized.TestCase):
     self.assertTrue(jnp.all(loss_direct >= 0.0))
     np.testing.assert_allclose(loss_direct, 0.0, atol=1e-6)
 
+  def _make_repeat_alignment_batch(self):
+    # Same-label repetition cases from `test_repeat_with_one_to_one_alignment`.
+    nclasses = 5
+    labels = np.array([
+        [1, 2, 2, 3],
+        [2, 3, 4, 4],
+        [1, 1, 1, 1],
+        [1, 1, 2, 3],
+        [1, 1, 1, 2],
+    ])
+    expected_alignment = [
+        [1, 2, 0, 2, 3],
+        [2, 3, 4, 0, 4],
+        [1, 0, 1, 0, 1, 0, 1],
+        [1, 0, 1, 2, 3],
+        [1, 0, 1, 0, 1, 2],
+    ]
+    batch_size = len(labels)
+    label_lens = np.array([4] * batch_size)
+    label_steps = 6
+    labels = np.pad(labels, [(0, 0), (0, label_steps - labels.shape[1])])
+    label_paddings = _lengths_to_paddings(label_lens, label_steps)
+    logit_lengths = np.array([len(seq) for seq in expected_alignment])
+    logit_steps = max(logit_lengths)
+    logits = np.random.randn(batch_size, logit_steps, nclasses).astype(
+        np.float32
+    )
+    logit_paddings = _lengths_to_paddings(logit_lengths, logit_steps)
+    return (
+        logits,
+        logit_paddings,
+        labels,
+        label_paddings,
+        expected_alignment,
+    )
+
+  def _fold_chunks(
+      self, labels, label_paddings, logits_chunks, padding_chunks, blank_id=0
+  ):
+    state = jax.jit(_classification.ctc_loss_init)(labels, label_paddings)
+    update = jax.jit(
+        _classification.ctc_loss_update, static_argnames=('blank_id',)
+    )
+    for logits_chunk, padding_chunk in zip(logits_chunks, padding_chunks):
+      state = update(
+          state, logits_chunk, padding_chunk, blank_id=blank_id
+      )
+    return jax.jit(_classification.ctc_loss_finalize)(state), state
+
+  @parameterized.parameters(
+      {'cuts': (23,)},
+      {'cuts': (0, 23)},
+      {'cuts': (1, 22, 23)},
+      {'cuts': (7, 15, 23)},
+      {'cuts': (3, 3, 11, 19, 23)},
+      {'cuts': (0, 5, 10, 17, 23)},
+  )
+  def test_chunked_loss_matches_full_for_any_split(self, cuts):
+    batchsize, steps, nclasses, nlabels = 4, 23, 7, 6
+    logits = np.random.randn(batchsize, steps, nclasses).astype(np.float32)
+    labels = np.random.randint(
+        1, nclasses, size=(batchsize, nlabels)
+    ).astype(np.int32)
+    # Introduce adjacent repeated labels in some sequences.
+    labels[0, 2] = labels[0, 1]
+    labels[2, 0] = labels[2, 1] = 3
+    label_paddings = _lengths_to_paddings(
+        np.array([6, 4, 6, 3]), nlabels
+    )
+    # Different sequences enter their right-padded region at different times.
+    logit_paddings = _lengths_to_paddings(
+        np.array([23, 12, 18, 9]), steps
+    )
+
+    bounds = (0,) + cuts
+    assert bounds[-1] == steps
+    logits_chunks = [
+        logits[:, bounds[i] : bounds[i + 1]] for i in range(len(bounds) - 1)
+    ]
+    padding_chunks = [
+        logit_paddings[:, bounds[i] : bounds[i + 1]]
+        for i in range(len(bounds) - 1)
+    ]
+
+    expected = jax.jit(_classification.ctc_loss)(
+        logits, logit_paddings, labels, label_paddings
+    )
+    actual, _ = self._fold_chunks(
+        labels, label_paddings, logits_chunks, padding_chunks
+    )
+    np.testing.assert_allclose(actual, expected, rtol=self._rtol)
+
+  def test_chunked_loss_with_blank_id_and_single_frame_chunks(self):
+    batchsize, steps, nclasses, nlabels = 3, 13, 5, 4
+    logits = np.random.randn(batchsize, steps, nclasses).astype(np.float32)
+    labels = np.random.randint(
+        0, nclasses - 1, size=(batchsize, nlabels)
+    ).astype(np.int32)
+    label_paddings = np.zeros((batchsize, nlabels), dtype=np.float32)
+    logit_paddings = np.zeros((batchsize, steps), dtype=np.float32)
+
+    expected = jax.jit(
+        _classification.ctc_loss, static_argnames=('blank_id',)
+    )(
+        logits, logit_paddings, labels, label_paddings, blank_id=nclasses - 1
+    )
+    # One chunk per frame: the mandatory blanks for repeated labels fall on
+    # every possible chunk boundary.
+    logits_chunks = [logits[:, t : t + 1] for t in range(steps)]
+    padding_chunks = [
+        logit_paddings[:, t : t + 1] for t in range(steps)
+    ]
+    actual, _ = self._fold_chunks(
+        labels,
+        label_paddings,
+        logits_chunks,
+        padding_chunks,
+        blank_id=nclasses - 1,
+    )
+    np.testing.assert_allclose(actual, expected, rtol=self._rtol)
+
+  def test_chunked_gradients_match_full(self):
+    batchsize, steps, nclasses, nlabels = 3, 17, 6, 5
+    logits = np.random.randn(batchsize, steps, nclasses).astype(np.float32)
+    labels = np.random.randint(
+        1, nclasses, size=(batchsize, nlabels)
+    ).astype(np.int32)
+    labels[0, 2] = labels[0, 1]
+    label_paddings = _lengths_to_paddings(np.array([5, 3, 5]), nlabels)
+    logit_paddings = _lengths_to_paddings(
+        np.array([17, 11, 8]), steps
+    )
+
+    def full_loss(x):
+      return jnp.average(
+          _classification.ctc_loss(
+              x, logit_paddings, labels, label_paddings
+          )
+      )
+
+    expected_loss, expected_grad = jax.jit(
+        jax.value_and_grad(full_loss)
+    )(logits)
+
+    # Uneven chunks, each consumed by a separately jitted update.
+    widths = (4, 2, 7, 4)
+    bounds = np.cumsum((0,) + widths)
+
+    def chunked_loss(*chunks):
+      state = _classification.ctc_loss_init(labels, label_paddings)
+      for i, chunk in enumerate(chunks):
+        state = _classification.ctc_loss_update(
+            state,
+            chunk,
+            logit_paddings[:, bounds[i] : bounds[i + 1]],
+        )
+      return jnp.average(_classification.ctc_loss_finalize(state))
+
+    chunks = tuple(
+        logits[:, bounds[i] : bounds[i + 1]] for i in range(len(widths))
+    )
+    actual_loss, chunk_grads = jax.jit(
+        jax.value_and_grad(chunked_loss, argnums=tuple(range(len(widths))))
+    )(*chunks)
+    actual_grad = np.concatenate(chunk_grads, axis=1)
+
+    np.testing.assert_allclose(actual_loss, expected_loss, rtol=self._rtol)
+    np.testing.assert_allclose(actual_grad, expected_grad, rtol=self._rtol)
+
+    # Fixed-width chunks folded by a single jitted `lax.scan` must match too.
+    width = 4
+    num_chunks = steps // width
+    used = width * num_chunks
+    scan_logits = np.asarray(logits[:, :used]).reshape(
+        batchsize, num_chunks, width, nclasses
+    )
+    scan_logits = np.transpose(scan_logits, (1, 0, 2, 3))
+    scan_paddings = np.asarray(logit_paddings[:, :used]).reshape(
+        batchsize, num_chunks, width
+    )
+    scan_paddings = np.transpose(scan_paddings, (1, 0, 2))
+
+    def scan_loss(x, m):
+      state0 = _classification.ctc_loss_init(labels, label_paddings)
+
+      def body(state, inputs):
+        x_chunk, m_chunk = inputs
+        return (
+            _classification.ctc_loss_update(state, x_chunk, m_chunk),
+            None,
+        )
+
+      state, _ = jax.lax.scan(body, state0, (x, m))
+      return jnp.average(_classification.ctc_loss_finalize(state))
+
+    scan_loss_jit = jax.jit(scan_loss)
+
+    def full_loss_used(x):
+      return jnp.average(
+          _classification.ctc_loss(
+              x, logit_paddings[:, :used], labels, label_paddings
+          )
+      )
+
+    np.testing.assert_allclose(
+        scan_loss_jit(scan_logits, scan_paddings),
+        full_loss_used(logits[:, :used]),
+        rtol=self._rtol,
+    )
+    scan_grad = jax.jit(jax.grad(scan_loss))(scan_logits, scan_paddings)
+    scan_grad = np.transpose(scan_grad, (1, 0, 2, 3)).reshape(
+        batchsize, used, nclasses
+    )
+    _, expected_grad_used = jax.jit(
+        jax.value_and_grad(full_loss_used)
+    )(logits[:, :used])
+    np.testing.assert_allclose(
+        scan_grad, expected_grad_used, rtol=self._rtol
+    )
+
+  def test_padded_chunks_leave_state_and_loss_unchanged(self):
+    batchsize, steps, nclasses, nlabels = 2, 10, 5, 3
+    logits = np.random.randn(batchsize, steps, nclasses).astype(np.float32)
+    labels = np.array([[1, 2, 3], [2, 2, 1]], dtype=np.int32)
+    label_paddings = np.zeros((batchsize, nlabels), dtype=np.float32)
+    logit_paddings = _lengths_to_paddings(np.array([7, 4]), steps)
+
+    state = jax.jit(_classification.ctc_loss_init)(labels, label_paddings)
+    update = jax.jit(_classification.ctc_loss_update)
+    state = update(state, logits[:, :7], logit_paddings[:, :7])
+    leaves_before = jax.tree_util.tree_leaves(state)
+    loss_before = jax.jit(_classification.ctc_loss_finalize)(state)
+
+    # From frame 7 on, every frame is padded for the whole batch.
+    for start, width in ((7, 2), (9, 1), (10, 3)):
+      if start + width <= steps:
+        state = update(
+            state,
+            logits[:, start : start + width],
+            logit_paddings[:, start : start + width],
+        )
+      else:
+        # Extra chunks beyond the original time axis are all padding.
+        pad_chunk = np.ones(
+            (batchsize, start + width - steps), dtype=np.float32
+        )
+        logits_chunk = np.zeros(
+            (batchsize, start + width - steps, nclasses), dtype=np.float32
+        )
+        state = update(state, logits_chunk, pad_chunk)
+    leaves_after = jax.tree_util.tree_leaves(state)
+    for before, after in zip(leaves_before, leaves_after):
+      np.testing.assert_array_equal(before, after)
+
+    loss_after = jax.jit(_classification.ctc_loss_finalize)(state)
+    np.testing.assert_allclose(loss_after, loss_before, rtol=self._rtol)
+
+    expected = jax.jit(_classification.ctc_loss)(
+        logits, logit_paddings, labels, label_paddings
+    )
+    np.testing.assert_allclose(loss_after, expected, rtol=self._rtol)
+
+  def test_chunked_repeat_labels_across_boundaries(self):
+    (
+        logits,
+        logit_paddings,
+        labels,
+        label_paddings,
+        expected_alignment,
+    ) = self._make_repeat_alignment_batch()
+    logit_steps = logits.shape[1]
+    logprobs = jax.nn.log_softmax(logits)
+
+    expected = jax.jit(_classification.ctc_loss)(
+        logits, logit_paddings, labels, label_paddings
+    )
+    # Every possible cut, including mandatory-blank frames on the boundary.
+    for cut in range(logit_steps + 1):
+      actual, _ = self._fold_chunks(
+          labels,
+          label_paddings,
+          [logits[:, :cut], logits[:, cut:]],
+          [logit_paddings[:, :cut], logit_paddings[:, cut:]],
+      )
+      np.testing.assert_allclose(actual, expected, rtol=self._rtol)
+
+    for n in range(len(expected_alignment)):
+      expected_loss = -sum(
+          logprobs[n, t, k] for t, k in enumerate(expected_alignment[n])
+      )
+      np.testing.assert_allclose(expected[n], expected_loss, rtol=self._rtol)
+
+  def test_chunked_empty_targets(self):
+    batchsize, steps, nclasses = 3, 11, 5
+
+    # Batch mixing an empty-target sequence with non-empty ones.
+    labels = np.array(
+        [[0, 0, 0, 0], [1, 2, 0, 0], [3, 3, 1, 0]], dtype=np.int32
+    )
+    label_paddings = _lengths_to_paddings(np.array([0, 2, 3]), 4)
+    logits = np.random.randn(batchsize, steps, nclasses).astype(np.float32)
+    logit_paddings = _lengths_to_paddings(
+        np.array([11, 8, 11]), steps
+    )
+
+    expected = jax.jit(_classification.ctc_loss)(
+        logits, logit_paddings, labels, label_paddings
+    )
+    actual, _ = self._fold_chunks(
+        labels,
+        label_paddings,
+        [logits[:, :5], logits[:, 5:]],
+        [logit_paddings[:, :5], logit_paddings[:, 5:]],
+    )
+    np.testing.assert_allclose(actual, expected, rtol=self._rtol)
+
+    def chunked_loss(x):
+      state = _classification.ctc_loss_init(labels, label_paddings)
+      state = _classification.ctc_loss_update(
+          state, x[:, :5], logit_paddings[:, :5]
+      )
+      state = _classification.ctc_loss_update(
+          state, x[:, 5:], logit_paddings[:, 5:]
+      )
+      return jnp.average(_classification.ctc_loss_finalize(state))
+
+    def full_loss(x):
+      return jnp.average(
+          _classification.ctc_loss(
+              x, logit_paddings, labels, label_paddings
+          )
+      )
+
+    chunked_grad = jax.jit(jax.grad(chunked_loss))(logits)
+    full_grad = jax.jit(jax.grad(full_loss))(logits)
+    np.testing.assert_allclose(chunked_grad, full_grad, rtol=self._rtol)
+
+    # Batch of only empty targets: only all-blank alignments are valid.
+    empty_labels = np.zeros((batchsize, 0), dtype=np.int32)
+    empty_label_paddings = np.zeros((batchsize, 0), dtype=np.float32)
+    empty_loss, state = self._fold_chunks(
+        empty_labels,
+        empty_label_paddings,
+        [logits[:, :3], logits[:, 3:]],
+        [logit_paddings[:, :3], logit_paddings[:, 3:]],
+    )
+    full_empty_loss = jax.jit(_classification.ctc_loss)(
+        logits, logit_paddings, empty_labels, empty_label_paddings
+    )
+    np.testing.assert_allclose(
+        empty_loss, full_empty_loss, rtol=self._rtol
+    )
+    blank_logprob = jax.nn.log_softmax(logits)[:, :, 0]
+    for n, length in enumerate([11, 8, 11]):
+      np.testing.assert_allclose(
+          empty_loss[n],
+          -jnp.sum(blank_logprob[n, :length]),
+          rtol=self._rtol,
+      )
+    # Initial alphas for empty targets only contain the initial blank state.
+    np.testing.assert_array_equal(
+        state.logalpha_phi.shape, (batchsize, 1)
+    )
+    np.testing.assert_array_equal(
+        state.logalpha_emit.shape, (batchsize, 0)
+    )
+
+  def test_state_shapes_independent_of_processed_time(self):
+    batchsize, nclasses, nlabels = 2, 4, 3
+    labels = np.array([[1, 2, 3], [2, 2, 1]], dtype=np.int32)
+    label_paddings = np.zeros((batchsize, nlabels), dtype=np.float32)
+    init_state = jax.jit(_classification.ctc_loss_init)(
+        labels, label_paddings
+    )
+    init_shapes = jax.tree_util.tree_map(
+        lambda x: x.shape, init_state
+    )
+    update = jax.jit(_classification.ctc_loss_update)
+    state = init_state
+    for _ in range(6):
+      logits = np.random.randn(batchsize, 3, nclasses).astype(np.float32)
+      paddings = np.zeros((batchsize, 3), dtype=np.float32)
+      state = update(state, logits, paddings)
+    self.assertEqual(
+        jax.tree_util.tree_map(lambda x: x.shape, state), init_shapes
+    )
+
+  def test_chunked_batch_size_mismatch_raises(self):
+    labels = np.zeros((2, 2), dtype=np.int32)
+    label_paddings = np.zeros((2, 2), dtype=np.float32)
+    state = _classification.ctc_loss_init(labels, label_paddings)
+    logits = np.zeros((3, 4, 5), dtype=np.float32)
+    logit_paddings = np.zeros((3, 4), dtype=np.float32)
+    with self.assertRaises(ValueError):
+      _classification.ctc_loss_update(state, logits, logit_paddings)
+
 
 class SigmoidFocalLossTest(parameterized.TestCase):
 

@@ -10,7 +10,11 @@ Losses
     convex_kl_divergence
     cosine_distance
     cosine_similarity
+    CTCLossState
     ctc_loss
+    ctc_loss_finalize
+    ctc_loss_init
+    ctc_loss_update
     ctc_loss_with_forward_probs
     dice_loss
     generalized_kl_divergence
